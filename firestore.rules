@@ -1,0 +1,166 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for authentication and membership validation
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwnerOfUserDoc(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isProjectMember(projectId) {
+      return isAuthenticated() && exists(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid));
+    }
+
+    function getProjectMemberData(projectId) {
+      return get(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid)).data;
+    }
+
+    function getProjectRole(projectId) {
+      return getProjectMemberData(projectId).role;
+    }
+
+    function isProjectOwner(projectId) {
+      return isProjectMember(projectId) && getProjectRole(projectId) == 'owner';
+    }
+
+    function isProjectManagerOrOwner(projectId) {
+      return isProjectMember(projectId) && (getProjectRole(projectId) == 'owner' || getProjectRole(projectId) == 'manager');
+    }
+
+    function isProjectViewer(projectId) {
+      return isProjectMember(projectId) && getProjectRole(projectId) == 'viewer';
+    }
+
+    // 1. User Profiles Collection: users/{userId}
+    match /users/{userId} {
+      // Authenticated users can view user profiles (needed for email member search and display names)
+      allow read: if isAuthenticated();
+      // Users can only create or update their own user profile document
+      allow create, update: if isOwnerOfUserDoc(userId);
+      // Profile deletion not permitted via client SDK
+      allow delete: if false;
+    }
+
+    // 2. Projects Collection: projects/{projectId}
+    match /projects/{projectId} {
+      // Only authorized project members or owners can read project details
+      allow read: if isAuthenticated() && (
+        resource.data.ownerId == request.auth.uid ||
+        (resource.data.memberUids != null && request.auth.uid in resource.data.memberUids) ||
+        isProjectMember(projectId)
+      );
+
+      // Project creation: Authenticated user must set themselves as the ownerId
+      allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
+
+      // Project update: Only owner or manager can update metadata; owner cannot be modified directly
+      allow update: if (resource.data.ownerId == request.auth.uid || isProjectManagerOrOwner(projectId)) && 
+        (request.resource.data.ownerId == resource.data.ownerId || isProjectOwner(projectId));
+
+      // Project deletion: Only the project owner can delete the project
+      allow delete: if resource.data.ownerId == request.auth.uid || isProjectOwner(projectId);
+
+      // 3. Project Members Subcollection: projects/{projectId}/members/{memberId}
+      match /members/{memberId} {
+        // Members can view the member roster of projects they belong to
+        allow read: if isProjectMember(projectId);
+
+        // Adding members: Owner creating their initial membership record OR manager/owner adding a member
+        allow create: if (isAuthenticated() && request.auth.uid == memberId && request.resource.data.role == 'owner') ||
+          (isProjectManagerOrOwner(projectId) && request.resource.data.uid == memberId);
+
+        // Updating member role: Only the project owner can change roles; users cannot elevate themselves
+        allow update: if isProjectOwner(projectId) && 
+          request.auth.uid != memberId && // cannot change own role
+          request.resource.data.uid == memberId;
+
+        // Removing members: Project owner can remove anyone; members can leave themselves
+        allow delete: if isProjectOwner(projectId) || (request.auth.uid == memberId && !isProjectOwner(projectId));
+      }
+
+      // 4. Project Tasks Subcollection: projects/{projectId}/tasks/{taskId}
+      match /tasks/{taskId} {
+        // All project members can read tasks
+        allow read: if isProjectMember(projectId);
+
+        // Task creation: Owners and managers can create tasks
+        allow create: if isProjectManagerOrOwner(projectId) && 
+          request.resource.data.creatorId == request.auth.uid &&
+          request.resource.data.projectId == projectId;
+
+        // Task updates:
+        // - Owners and managers have full task update rights
+        // - Assigned members can ONLY update status and notes on their own assigned tasks
+        // - Viewers have NO write permissions
+        allow update: if (isProjectManagerOrOwner(projectId)) || 
+          (isProjectMember(projectId) && 
+           resource.data.assigneeId == request.auth.uid && 
+           !isProjectViewer(projectId) &&
+           request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt', 'completedAt']));
+
+        // Task deletion: Only owners and managers
+        allow delete: if isProjectManagerOrOwner(projectId);
+
+        // 5. Task Comments: projects/{projectId}/tasks/{taskId}/comments/{commentId}
+        match /comments/{commentId} {
+          allow read: if isProjectMember(projectId);
+          allow create: if isProjectMember(projectId) && 
+            !isProjectViewer(projectId) &&
+            request.resource.data.authorId == request.auth.uid;
+          allow update, delete: if isProjectOwner(projectId) || 
+            (isProjectMember(projectId) && resource.data.authorId == request.auth.uid);
+        }
+      }
+
+      // 6. Project Expenses Subcollection: projects/{projectId}/expenses/{expenseId}
+      match /expenses/{expenseId} {
+        // Project members can view expenses (viewers can view budget stats)
+        allow read: if isProjectMember(projectId);
+
+        // Only project owners and managers can record, edit, or remove expenses
+        allow create: if isProjectManagerOrOwner(projectId) && 
+          request.resource.data.creatorId == request.auth.uid &&
+          request.resource.data.amount > 0;
+
+        allow update, delete: if isProjectManagerOrOwner(projectId);
+      }
+
+      // 7. Project Activity Feed Subcollection: projects/{projectId}/activity/{activityId}
+      match /activity/{activityId} {
+        // Members can read activity audit logs
+        allow read: if isProjectMember(projectId);
+
+        // Append-only audit entries created by members matching their authenticated UID (or initial project creation log)
+        allow create: if isAuthenticated() && request.resource.data.actorId == request.auth.uid &&
+          (isProjectMember(projectId) || request.resource.data.type == 'project_created');
+
+        // Activity records are immutable once logged
+        allow update, delete: if false;
+      }
+    }
+
+    // 8. Invitations Collection: invitations/{invitationId}
+    match /invitations/{invitationId} {
+      // User can read invitation if addressed to their email or created by them
+      allow read: if isAuthenticated() && 
+        (resource.data.email == request.auth.token.email || resource.data.inviterId == request.auth.uid);
+
+      // Only project owner/manager can create invitations
+      allow create: if isAuthenticated() && 
+        isProjectManagerOrOwner(request.resource.data.projectId) &&
+        request.resource.data.inviterId == request.auth.uid;
+
+      // Acceptance: Only intended recipient can accept
+      allow update: if isAuthenticated() && 
+        resource.data.email == request.auth.token.email &&
+        request.resource.data.status in ['accepted', 'revoked'];
+
+      allow delete: if isAuthenticated() && 
+        (resource.data.inviterId == request.auth.uid || isProjectOwner(resource.data.projectId));
+    }
+  }
+}
