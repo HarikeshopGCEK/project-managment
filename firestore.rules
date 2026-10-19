@@ -11,28 +11,52 @@ service cloud.firestore {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
-    function isProjectMember(projectId) {
-      return isAuthenticated() && exists(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid));
+    // Direct check on the root project document
+    function isProjectDocOwner(projectId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/projects/$(projectId)) &&
+        get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid;
     }
 
-    function getProjectMemberData(projectId) {
-      return get(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid)).data;
+    // Check if user is registered with 'owner' role in the project members subcollection
+    function isProjectMemberDocOwner(projectId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid)).data.role == 'owner';
     }
 
-    function getProjectRole(projectId) {
-      return getProjectMemberData(projectId).role;
-    }
-
+    // A user is a project owner if they are the owner on the project doc or in the members subcollection
     function isProjectOwner(projectId) {
-      return isProjectMember(projectId) && getProjectRole(projectId) == 'owner';
+      return isAuthenticated() && (isProjectDocOwner(projectId) || isProjectMemberDocOwner(projectId));
     }
 
+    // A user is a project member if they are the owner, listed in project memberUids, or have a member doc
+    function isProjectMember(projectId) {
+      return isAuthenticated() && (
+        isProjectOwner(projectId) ||
+        (exists(/databases/$(database)/documents/projects/$(projectId)) &&
+         get(/databases/$(database)/documents/projects/$(projectId)).data.memberUids != null &&
+         request.auth.uid in get(/databases/$(database)/documents/projects/$(projectId)).data.memberUids) ||
+        exists(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid))
+      );
+    }
+
+    // Project manager or owner check
     function isProjectManagerOrOwner(projectId) {
-      return isProjectMember(projectId) && (getProjectRole(projectId) == 'owner' || getProjectRole(projectId) == 'manager');
+      return isAuthenticated() && (
+        isProjectOwner(projectId) ||
+        (exists(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid)) &&
+         (get(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid)).data.role == 'owner' ||
+          get(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid)).data.role == 'manager'))
+      );
     }
 
+    // Viewer role check (only if they are explicitly marked as 'viewer')
     function isProjectViewer(projectId) {
-      return isProjectMember(projectId) && getProjectRole(projectId) == 'viewer';
+      return isAuthenticated() &&
+        !isProjectOwner(projectId) &&
+        exists(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid)).data.role == 'viewer';
     }
 
     // 1. User Profiles Collection: users/{userId}
@@ -43,6 +67,11 @@ service cloud.firestore {
       allow create, update: if isOwnerOfUserDoc(userId);
       // Profile deletion not permitted via client SDK
       allow delete: if false;
+    }
+
+    // Collection group rule for cross-project task querying (My Tasks)
+    match /{path=**}/tasks/{taskId} {
+      allow read: if isAuthenticated() && resource.data.assigneeId == request.auth.uid;
     }
 
     // 2. Projects Collection: projects/{projectId}
@@ -57,7 +86,7 @@ service cloud.firestore {
       // Project creation: Authenticated user must set themselves as the ownerId
       allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
 
-      // Project update: Only owner or manager can update metadata; owner cannot be modified directly
+      // Project update: Only owner or manager can update metadata; owner can transfer ownership
       allow update: if (resource.data.ownerId == request.auth.uid || isProjectManagerOrOwner(projectId)) && 
         (request.resource.data.ownerId == resource.data.ownerId || isProjectOwner(projectId));
 
@@ -73,13 +102,11 @@ service cloud.firestore {
         allow create: if (isAuthenticated() && request.auth.uid == memberId && request.resource.data.role == 'owner') ||
           (isProjectManagerOrOwner(projectId) && request.resource.data.uid == memberId);
 
-        // Updating member role: Only the project owner can change roles; users cannot elevate themselves
-        allow update: if isProjectOwner(projectId) && 
-          request.auth.uid != memberId && // cannot change own role
-          request.resource.data.uid == memberId;
+        // Updating member role: Project owner can change roles
+        allow update: if isProjectOwner(projectId) && request.resource.data.uid == memberId;
 
         // Removing members: Project owner can remove anyone; members can leave themselves
-        allow delete: if isProjectOwner(projectId) || (request.auth.uid == memberId && !isProjectOwner(projectId));
+        allow delete: if isProjectOwner(projectId) || (isAuthenticated() && request.auth.uid == memberId);
       }
 
       // 4. Project Tasks Subcollection: projects/{projectId}/tasks/{taskId}
@@ -138,8 +165,9 @@ service cloud.firestore {
         allow create: if isAuthenticated() && request.resource.data.actorId == request.auth.uid &&
           (isProjectMember(projectId) || request.resource.data.type == 'project_created');
 
-        // Activity records are immutable once logged
-        allow update, delete: if false;
+        // Activity records are immutable once logged, but project owner can delete them when deleting the project
+        allow update: if false;
+        allow delete: if isProjectOwner(projectId);
       }
     }
 

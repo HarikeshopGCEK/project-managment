@@ -32,6 +32,8 @@ export function getFriendlyAuthErrorMessage(errorCode: string): string {
       return "Email/Password sign-in is not enabled in Firebase Console. Please enable it under Authentication > Sign-in method.";
     case "auth/popup-closed-by-user":
       return "Google sign-in popup was closed before completing.";
+    case "auth/unauthorized-domain":
+      return "This domain is not authorized in Firebase Console. Add your Vercel domain under Authentication > Settings > Authorized domains.";
     default:
       return "Authentication error: " + (errorCode || "An unexpected error occurred.");
   }

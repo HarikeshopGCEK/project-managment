@@ -162,20 +162,32 @@ export async function updateFirestoreProject(
 
 export async function deleteFirestoreProject(projectId: string): Promise<void> {
   const firestore = assertDb();
-  // To avoid orphaned records, clean subcollections then delete project doc
-  const membersSnap = await getDocs(collection(firestore, "projects", projectId, "members"));
-  const tasksSnap = await getDocs(collection(firestore, "projects", projectId, "tasks"));
-  const expensesSnap = await getDocs(collection(firestore, "projects", projectId, "expenses"));
-  const activitySnap = await getDocs(collection(firestore, "projects", projectId, "activity"));
+  // To avoid orphaned records, clean subcollections first then delete project doc
+  const [membersSnap, tasksSnap, expensesSnap, activitySnap] = await Promise.all([
+    getDocs(collection(firestore, "projects", projectId, "members")),
+    getDocs(collection(firestore, "projects", projectId, "tasks")),
+    getDocs(collection(firestore, "projects", projectId, "expenses")),
+    getDocs(collection(firestore, "projects", projectId, "activity")),
+  ]);
 
-  const batch = writeBatch(firestore);
-  membersSnap.forEach((d) => batch.delete(d.ref));
-  tasksSnap.forEach((d) => batch.delete(d.ref));
-  expensesSnap.forEach((d) => batch.delete(d.ref));
-  activitySnap.forEach((d) => batch.delete(d.ref));
-  batch.delete(doc(firestore, "projects", projectId));
+  const subDocRefs = [
+    ...membersSnap.docs.map((d) => d.ref),
+    ...tasksSnap.docs.map((d) => d.ref),
+    ...expensesSnap.docs.map((d) => d.ref),
+    ...activitySnap.docs.map((d) => d.ref),
+  ];
 
-  await batch.commit();
+  // Batch delete subcollection records in safe chunks (Firestore max is 500 per batch)
+  const chunkSize = 400;
+  for (let i = 0; i < subDocRefs.length; i += chunkSize) {
+    const chunk = subDocRefs.slice(i, i + chunkSize);
+    const batch = writeBatch(firestore);
+    chunk.forEach((ref) => batch.delete(ref));
+    await batch.commit();
+  }
+
+  // Finally, delete the root project document
+  await deleteDoc(doc(firestore, "projects", projectId));
 }
 
 // ---------------- MEMBERS & ROLES ----------------
